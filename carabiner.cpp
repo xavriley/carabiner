@@ -6,9 +6,13 @@
 
 #include <ableton/Link.hpp>
 
+#include "oscpkt.hh"
+
 extern "C" {
 #include "mongoose.h"
 }
+
+double quantum{1.0};
 
 // Validators for command-line arguments
 static bool validatePort(const char* flagname, gflags::int32 value) {
@@ -35,6 +39,12 @@ static const bool poll_dummy = gflags::RegisterFlagValidator(&FLAGS_poll, &valid
 
 // Our interface to the Link session
 ableton::Link linkInstance(120.);
+
+// For outbound OSC comms
+// Adapted from https://stackoverflow.com/a/32274589/2618015
+asio::io_service io_service;
+asio::ip::udp::socket sock(io_service);
+asio::ip::udp::endpoint remote_endpoint;
 
 // Keep track of open TCP connections, and those which need updates sent to them
 std::set<struct mg_connection *> activeConnections, updatedConnections;
@@ -317,6 +327,14 @@ void tempoCallback(double bpm) {
   updatedMutex.lock();
   updatedConnections.clear();
   updatedMutex.unlock();
+
+  oscpkt::PacketWriter pkt;
+  oscpkt::Message message("/link/tempo");
+  message.pushDouble(bpm);
+  pkt.addMessage(message);
+
+  asio::error_code err;
+  sock.send_to(asio::buffer(pkt.packetData(), pkt.packetSize()), remote_endpoint, 0, err);
 }
 
 // Registered to be called by a Link thread whenever the number of peers changes; arranges for an update to
@@ -335,6 +353,40 @@ void startStopCallback(bool isPlaying) {
   updatedMutex.unlock();
 }
 
+void sendBeatMessage() {
+  ableton::Link::SessionState sessionState = linkInstance.captureAppSessionState();
+  double currentBeatWithinBar = sessionState.phaseAtTime(linkInstance.clock().micros(), quantum);
+
+  oscpkt::PacketWriter pkt;
+  oscpkt::Message message("/link/beat");
+
+  message.pushDouble(double(floor(currentBeatWithinBar)));
+  pkt.addMessage(message);
+
+  asio::error_code err;
+  sock.send_to(asio::buffer(pkt.packetData(), pkt.packetSize()), remote_endpoint, 0, err);
+}
+
+std::chrono::nanoseconds time_until_next_beat() {
+  ableton::Link::SessionState sessionState = linkInstance.captureAppSessionState();
+  double currentBeat = sessionState.beatAtTime(linkInstance.clock().micros(), quantum);
+
+  std::chrono::nanoseconds time_until_next_beat =
+    sessionState.timeAtBeat(floor(currentBeat) + 1.0, quantum) - linkInstance.clock().micros();
+
+  return time_until_next_beat;
+}
+
+void setupOscComms() {
+  sock.open(asio::ip::udp::v4());
+  // TODO: make host and port configurable
+  remote_endpoint = asio::ip::udp::endpoint(asio::ip::address::from_string("127.0.0.1"), 4559);
+}
+
+void teardownOscComms() {
+  sock.close();
+}
+
 int main(int argc, char* argv[]) {
   gflags::SetUsageMessage("Bridge to an Ableton Link session. Sample usage:\n" + std::string(argv[0]) +
                           " --port 1234 --poll 10");
@@ -346,10 +398,15 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  setupOscComms();
+
   linkInstance.setTempoCallback(tempoCallback);
   linkInstance.setNumPeersCallback(peersCallback);
   linkInstance.setStartStopCallback(startStopCallback);
-  linkInstance.enableStartStopSync(syncStartStop);
+  linkInstance.enableStartStopSync(true); //syncStartStop);
+  ableton::Link::SessionState sessionState = linkInstance.captureAppSessionState();
+  sessionState.setTempo(120.0, linkInstance.clock().micros());
+  linkInstance.commitAppSessionState(sessionState);
   linkInstance.enable(true);
 
   struct mg_mgr mgr;
@@ -361,13 +418,17 @@ int main(int argc, char* argv[]) {
   std::cout << "Starting Carabiner on port " << port << std::endl;
 
   for (;;) {
+    sendBeatMessage();
+    std::this_thread::sleep_for(time_until_next_beat());
+
     std::cout << "Link bpm: " << linkInstance.captureAppSessionState().tempo() <<
       " Peers: " << linkInstance.numPeers() <<
       " Connections: " << activeConnections.size() << "     \r" << std::flush;
 
-    mg_mgr_poll(&mgr, FLAGS_poll);
+    //mg_mgr_poll(&mgr, FLAGS_poll);
   }
   mg_mgr_free(&mgr);
+  teardownOscComms();
 
   return 0;
 }
